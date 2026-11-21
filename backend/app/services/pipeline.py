@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from app.store import store
+from app.services.batch_text import BatchHandoff, batch_text_index
 
 
 def _now_iso() -> str:
@@ -89,52 +90,85 @@ class IngestPipeline:
                 return {"ok": False, "message": f"数据源 {source_id} 已有进行中的批次 {b.get('批次编号')}", "batch": b}
 
         batch_no = f"INGE-{_next_id('ingest_batch'):04d}"
+        handoff = BatchHandoff(
+            batch_no=batch_no,
+            source_id=source_id,
+            time_window=time_window,
+            record_count=len(raw_logs) if raw_logs else 0,
+            status="采集中",
+            batch_version=1,
+            source_version=source_entry.get("source_version", 1),
+            started_at=_now_iso(),
+        )
         batch_entry = {
             "id": _next_id("ingest_batch"),
-            "批次编号": batch_no,
-            "所属数据源": source_id,
-            "采集时间窗口": time_window,
-            "记录总数": str(len(raw_logs) if raw_logs else 0),
+            "批次编号": handoff.batch_no,
+            "所属数据源": handoff.source_id,
+            "采集时间窗口": handoff.time_window,
+            "记录总数": str(handoff.record_count),
             "批次状态": time_window,
-            "status": "采集中",
+            "status": handoff.status,
             "pending": True,
             "abnormal": False,
-            "batch_version": 1,
-            "source_version": source_entry.get("source_version", 1),
-            "started_at": _now_iso(),
+            "batch_version": handoff.batch_version,
+            "source_version": handoff.source_version,
+            "started_at": handoff.started_at,
         }
         batches.append(batch_entry)
 
-        # 生成原始日志记录
-        raw_records_list = store.rows("raw_records")
-        created_ids: list[int] = []
-        if raw_logs:
-            for idx, log in enumerate(raw_logs):
-                raw_id = _next_id("raw_records")
-                record = {
-                    "id": raw_id,
-                    "批次编号": batch_no,
-                    "原始行号": str(idx + 1),
-                    "采集时间戳": _now_iso(),
-                    "原始正文": log.get("body", str(log)),
-                    "解析状态": "未解析",
-                    "status": "待解析",
-                    "pending": True,
-                    "abnormal": False,
-                    "batch_version": 1,
-                    "source_id": source_id,
-                    "ingested_at": _now_iso(),
-                }
-                raw_records_list.append(record)
-                created_ids.append(raw_id)
+        # 登记批次交接：原始行可随启动一次性写入，也可后续经 ingest_raw_lines 接续接收。
+        # 编号与正文的对应关系统一由批次原文映射（batch_text_index）维护。
+        batch_text_index.register_open_batch(handoff)
 
+        # 通过统一入口把原文写入解析来源清单，批号、行号口径保持不变（行号从 1 起）。
+        identities = batch_text_index.ingest_lines(batch_no, raw_logs or [], source_id)
+        created_ids = [identity.record_id for identity in identities]
         batch_entry["记录总数"] = str(len(created_ids))
+        # 旧字段保留：既有引用（raw_record_ids / 批号 + 行号）继续可用。
         batch_entry["raw_record_ids"] = json.dumps(created_ids)
         return {
             "ok": True,
             "message": f"采集批次 {batch_no} 已启动",
             "batch": batch_entry,
             "record_count": len(created_ids),
+        }
+
+    # ---------- 阶段1.5：批次原文接续接收 ----------
+    def ingest_raw_lines(
+        self,
+        batch_no: str,
+        raw_logs: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """向仍在接收原文的批次追加原始行，行号在批次原文映射内接续编号。
+
+        与启动并发时，批次已登记而原文尚未收齐也可调用；已存在的记录编号始终
+        能定位回原文。
+        """
+        handoff = batch_text_index.get_handoff(batch_no)
+        source_id = handoff.source_id if handoff else ""
+        batch_entry = next(
+            (b for b in store.rows("ingest_batch") if b.get("批次编号") == batch_no),
+            None,
+        )
+        if batch_entry is None:
+            return {"ok": False, "message": f"批次 {batch_no} 不存在"}
+        if not source_id:
+            source_id = str(batch_entry.get("所属数据源", ""))
+
+        identities = batch_text_index.ingest_lines(batch_no, raw_logs, source_id)
+        created_ids = [identity.record_id for identity in identities]
+        total = batch_text_index.record_count(batch_no)
+        batch_entry["记录总数"] = str(total)
+        # 同步维护旧引用字段，保证历史口径不变。
+        previous_ids = json.loads(batch_entry.get("raw_record_ids") or "[]")
+        batch_entry["raw_record_ids"] = json.dumps(previous_ids + created_ids)
+        return {
+            "ok": True,
+            "message": f"批次 {batch_no} 已接收 {len(created_ids)} 条原文",
+            "batch_no": batch_no,
+            "record_count": total,
+            "received": len(created_ids),
+            "raw_record_ids": created_ids,
         }
 
     # ---------- 阶段2：字段解析 ----------
@@ -144,8 +178,9 @@ class IngestPipeline:
         parser_rule_name: str | None = None,
     ) -> dict[str, Any]:
         """解析批次中的原始日志为标准化明细。"""
-        raw_records_list = store.rows("raw_records")
-        batch_raw = [r for r in raw_records_list if r.get("批次编号") == batch_no]
+        # 通过批次原文映射接续读取：只取身份完整且尚未标准化的行，
+        # 启动/解析并发时未收齐的行不会进入本次标准化处理。
+        batch_raw = batch_text_index.pending_lines_for(batch_no)
         if not batch_raw:
             return {"ok": False, "message": f"批次 {batch_no} 无原始日志记录"}
 
@@ -178,6 +213,7 @@ class IngestPipeline:
         failure_count = 0
         parsed_ids: list[int] = []
         failed_ids: list[int] = []
+        succeeded_raw_ids: list[int] = []
 
         for raw in batch_raw:
             raw_id = raw["id"]
@@ -202,17 +238,15 @@ class IngestPipeline:
                     "content_digest": _stable_digest(fields),
                 }
                 parsed_entities.append(entity)
-                raw["status"] = "已解析"
-                raw["pending"] = False
-                raw["解析状态"] = "已解析"
                 success_count += 1
+                succeeded_raw_ids.append(raw_id)
                 parsed_ids.append(ent_id)
             except Exception:
-                raw["status"] = "解析失败"
-                raw["解析状态"] = "解析失败"
-                raw["abnormal"] = True
                 failure_count += 1
                 failed_ids.append(raw_id)
+
+        # 处置结果统一回写解析来源清单（raw_records），字段与状态语义保持不变。
+        batch_text_index.mark_parse_outcome(succeeded_raw_ids, failed_ids)
 
         # 更新批次状态
         batches = store.rows("ingest_batch")
@@ -224,6 +258,8 @@ class IngestPipeline:
                 b["parsed_ids"] = json.dumps(parsed_ids)
                 b["batch_version"] = b.get("batch_version", 1) + 1
                 break
+        if failure_count == 0:
+            batch_text_index.close_batch(batch_no)
 
         # 记录解析日志
         journal = store.rows("parse_journal")
@@ -710,20 +746,25 @@ class IngestPipeline:
 
     # ---------- 失败恢复 ----------
     def recover_batch(self, batch_no: str) -> dict[str, Any]:
-        """恢复失败的采集批次：重试解析失败记录。"""
-        retry_q = store.rows("retry_queue")
-        raw_records_list = store.rows("raw_records")
+        """恢复失败的采集批次：重试解析失败记录。
 
-        failed_raw = [r for r in raw_records_list
-                      if r.get("批次编号") == batch_no and r.get("status") == "解析失败"]
+        中断后恢复沿用批次原文映射里既有的批号/行号引用，不重新编号、不重建原文。
+        """
+        retry_q = store.rows("retry_queue")
+
+        failed_raw = [
+            r for r in batch_text_index.lines_for(batch_no)
+            if r.get("status") == "解析失败"
+        ]
 
         recovered = 0
         still_failed = 0
         for raw in failed_raw:
+            raw_id = raw["id"]
             # 查找对应重试记录
             retry_entry = None
             for r in retry_q:
-                if r.get("失败记录ID") == str(raw["id"]):
+                if r.get("失败记录ID") == str(raw_id):
                     retry_entry = r
                     break
             if retry_entry:
@@ -741,10 +782,9 @@ class IngestPipeline:
             body = raw.get("原始正文", "")
             parts = body.split("|") if "|" in body else [body]
             if len(parts) >= 2:
-                raw["status"] = "待解析" if retry_entry else raw["status"]
-                raw["解析状态"] = "待解析"
-                raw["pending"] = True
-                raw["abnormal"] = False
+                if retry_entry:
+                    # 通过映射回写来源清单，原始记录引用保持不变。
+                    batch_text_index.reset_for_retry(raw_id)
                 recovered += 1
             else:
                 raw["status"] = "解析失败"

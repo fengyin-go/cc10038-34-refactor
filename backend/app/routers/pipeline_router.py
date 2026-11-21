@@ -23,6 +23,11 @@ class IngestBatchPayload(BaseModel):
     raw_logs: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class IngestLinesPayload(BaseModel):
+    batch_no: str = Field(..., min_length=1)
+    raw_logs: list[dict[str, Any]] = Field(..., min_length=1)
+
+
 class ParseBatchPayload(BaseModel):
     batch_no: str = Field(..., min_length=1)
     parser_rule_name: str | None = None
@@ -85,6 +90,11 @@ def pipeline_validate_source(source_id: str = Query(..., min_length=1)) -> dict[
 @router.post("/batch/start")
 def pipeline_start_batch(payload: IngestBatchPayload) -> dict[str, Any]:
     return pipeline.start_ingest_batch(payload.source_id, payload.time_window, payload.raw_logs)
+
+
+@router.post("/batch/ingest")
+def pipeline_ingest_lines(payload: IngestLinesPayload) -> dict[str, Any]:
+    return pipeline.ingest_raw_lines(payload.batch_no, payload.raw_logs)
 
 
 @router.post("/batch/parse")
